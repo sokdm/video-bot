@@ -9,16 +9,17 @@ from flask import Flask
 import yt_dlp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters
-from telegram.constants import ParseMode
 
-TOKEN = "8654529573:AAHcPpsJ-YCRBJP-ZhrVmtrauhrQGq0HcQ0"
-ADMIN_ID = 7973440858
-DB_PATH = "bot_database.db"
-DOWNLOAD_PATH = "downloads"
+# ============ CONFIG ============
+TOKEN = os.environ.get("TOKEN", "8654529573:AAHcPpsJ-YCRBJP-ZhrVmtrauhrQGq0HcQ0")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "7973440858"))
+DB_PATH = "/tmp/bot_database.db"
+DOWNLOAD_PATH = "/tmp/downloads"
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ============ FLASK WEB SERVER (Required for Render) ============
 app = Flask(__name__)
 
 @app.route('/')
@@ -27,12 +28,13 @@ def home():
 
 @app.route('/health')
 def health():
-    return {"status": "alive"}
+    return {"status": "alive", "users": db.get_stats()['users']}
 
 def run_web():
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
 
+# ============ DATABASE ============
 class Database:
     def __init__(self):
         self.init_db()
@@ -205,13 +207,17 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = db.get_stats()
     await update.message.reply_text(f"Admin Stats:\nUsers: {s['users']}\nDownloads: {s['downloads']}")
 
+# ============ MAIN ============
 def main():
-    web_thread = threading.Thread(target=run_web)
-    web_thread.daemon = True
+    # Start web server in background
+    web_thread = threading.Thread(target=run_web, daemon=True)
     web_thread.start()
+    logger.info("Web server started")
     
+    # Build bot application
     application = Application.builder().token(TOKEN).build()
     
+    # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stats", stats_cmd))
     application.add_handler(CommandHandler("help", help_cmd))
@@ -219,8 +225,10 @@ def main():
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     
-    logger.info("Bot started!")
-    application.run_polling(drop_pending_updates=True)
+    logger.info("Bot starting...")
+    # Use webhook for Render (more stable than polling for web services)
+    # For now, try polling with drop_pending_updates
+    application.run_polling(drop_pending_updates=True, timeout=30)
 
 if __name__ == '__main__':
     main()
