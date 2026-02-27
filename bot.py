@@ -1,41 +1,38 @@
 import logging
 import os
 import sqlite3
+import asyncio
 import re
 import threading
-import time
 from datetime import datetime
 from flask import Flask
 import yt_dlp
-import telegram
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackQueryHandler
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters
+from telegram.constants import ParseMode
 
-# ============ CONFIG ============
-TOKEN = os.environ.get("TOKEN", "8654529573:AAHcPpsJ-YCRBJP-ZhrVmtrauhrQGq0HcQ0")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "7973440858"))
-DB_PATH = "/tmp/bot.db"
-DOWNLOAD_PATH = "/tmp/downloads"
+TOKEN = "8654529573:AAHcPpsJ-YCRBJP-ZhrVmtrauhrQGq0HcQ0"
+ADMIN_ID = 7973440858
+DB_PATH = "bot_database.db"
+DOWNLOAD_PATH = "downloads"
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ============ FLASK (Keep Render Alive) ============
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot running!"
+    return "Bot is running!"
 
 @app.route('/health')
 def health():
-    return {"status": "ok"}
+    return {"status": "alive"}
 
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port, threaded=True)
+def run_web():
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
 
-# ============ DATABASE ============
 class Database:
     def __init__(self):
         self.init_db()
@@ -96,8 +93,7 @@ def detect_platform(url):
             return plat
     return None
 
-def download_video(url):
-    import os
+async def download_video(url):
     os.makedirs(DOWNLOAD_PATH, exist_ok=True)
     opts = {
         'quiet': True,
@@ -106,27 +102,29 @@ def download_video(url):
         'format': 'best[filesize<50M]'
     }
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-            if not os.path.exists(filename):
-                base = os.path.splitext(filename)[0]
-                for ext in ['.mp4', '.mkv', '.webm']:
-                    if os.path.exists(base + ext):
-                        filename = base + ext
-                        break
-            return {
-                'file': filename,
-                'title': info.get('title', 'Video')[:100],
-                'uploader': info.get('uploader', 'Unknown'),
-                'duration': info.get('duration', 0)
-            }
+        loop = asyncio.get_event_loop()
+        def _dl():
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filename = ydl.prepare_filename(info)
+                if not os.path.exists(filename):
+                    base = os.path.splitext(filename)[0]
+                    for ext in ['.mp4', '.mkv', '.webm']:
+                        if os.path.exists(base + ext):
+                            filename = base + ext
+                            break
+                return {
+                    'file': filename,
+                    'title': info.get('title', 'Video')[:100],
+                    'uploader': info.get('uploader', 'Unknown'),
+                    'duration': info.get('duration', 0)
+                }
+        return await loop.run_in_executor(None, _dl)
     except Exception as e:
         logger.error(f"Download error: {e}")
         raise e
 
-# ============ HANDLERS ============
-def start(update, context):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     db.add_user(user)
     
@@ -146,80 +144,83 @@ Facebook
 
 Just paste the link!"""
     
-    update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-def handle_link(update, context):
+async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     url = update.message.text.strip()
     
     if not url.startswith('http'):
-        update.message.reply_text("Send a valid URL starting with http")
+        await update.message.reply_text("Send a valid URL starting with http")
         return
     
     platform = detect_platform(url)
     if not platform:
-        update.message.reply_text("Unsupported platform")
+        await update.message.reply_text("Unsupported platform")
         return
     
-    msg = update.message.reply_text(f"Downloading from {platform}...")
+    msg = await update.message.reply_text(f"Downloading from {platform}...")
     
     try:
-        result = download_video(url)
+        result = await download_video(url)
         
         size = os.path.getsize(result['file'])
         if size > 50 * 1024 * 1024:
-            msg.edit_text("File too big (max 50MB)")
+            await msg.edit_text("File too big (max 50MB)")
             os.remove(result['file'])
             return
         
         with open(result['file'], 'rb') as f:
-            update.message.reply_video(
+            await update.message.reply_video(
                 video=f,
                 caption=f"{result['title']}\nBy: {result['uploader']}\nNo watermark!"
             )
         
         db.log_download(user.id, platform, url)
-        msg.delete()
+        await msg.delete()
         os.remove(result['file'])
         
     except Exception as e:
-        msg.edit_text(f"Error: {str(e)[:200]}\nCheck if video is public!")
+        await msg.edit_text(f"Error: {str(e)[:200]}\nCheck if video is public!")
         db.log_download(user.id, platform, url, success=False)
 
-def stats_cmd(update, context):
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = db.get_stats()
-    update.message.reply_text(f"Users: {s['users']}\nDownloads: {s['downloads']}")
+    await update.message.reply_text(f"Users: {s['users']}\nDownloads: {s['downloads']}")
 
-def help_cmd(update, context):
-    update.message.reply_text("How to use:\n1. Copy video link\n2. Paste here\n3. Wait for download")
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("How to use:\n1. Copy video link\n2. Paste here\n3. Wait for download")
 
-def button_handler(update, context):
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    query.answer()
+    await query.answer()
     if query.data == 'stats':
-        stats_cmd(update, context)
+        await stats_cmd(update, context)
     elif query.data == 'help':
-        help_cmd(update, context)
+        await help_cmd(update, context)
 
-# ============ MAIN ============
+async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    s = db.get_stats()
+    await update.message.reply_text(f"Admin Stats:\nUsers: {s['users']}\nDownloads: {s['downloads']}")
+
 def main():
-    # Start Flask in background (keeps Render alive)
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
+    web_thread = threading.Thread(target=run_web)
+    web_thread.daemon = True
+    web_thread.start()
     
-    # Use OLD style Updater (v13 compatible)
-    updater = Updater(TOKEN, use_context=True)
-    dp = updater.dispatcher
+    application = Application.builder().token(TOKEN).build()
     
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CommandHandler("stats", stats_cmd))
-    dp.add_handler(CommandHandler("help", help_cmd))
-    dp.add_handler(CallbackQueryHandler(button_handler))
-    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_link))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("stats", stats_cmd))
+    application.add_handler(CommandHandler("help", help_cmd))
+    application.add_handler(CommandHandler("admin", admin_cmd))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     
     logger.info("Bot started!")
-    updater.start_polling()
-    updater.idle()
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
     main()
