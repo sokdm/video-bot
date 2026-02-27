@@ -1,26 +1,39 @@
 import logging
 import os
 import sqlite3
-import asyncio
 import re
+import threading
+import time
 from datetime import datetime
-from flask import Flask, request, jsonify
+from flask import Flask
 import yt_dlp
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters
+import telegram
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackQueryHandler
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 # ============ CONFIG ============
-TOKEN = os.environ.get("TOKEN")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
-
-if not TOKEN:
-    raise ValueError("No TOKEN environment variable set!")
-
+TOKEN = os.environ.get("TOKEN", "8654529573:AAHcPpsJ-YCRBJP-ZhrVmtrauhrQGq0HcQ0")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "7973440858"))
 DB_PATH = "/tmp/bot.db"
 DOWNLOAD_PATH = "/tmp/downloads"
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ============ FLASK (Keep Render Alive) ============
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot running!"
+
+@app.route('/health')
+def health():
+    return {"status": "ok"}
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port, threaded=True)
 
 # ============ DATABASE ============
 class Database:
@@ -83,7 +96,8 @@ def detect_platform(url):
             return plat
     return None
 
-async def download_video(url):
+def download_video(url):
+    import os
     os.makedirs(DOWNLOAD_PATH, exist_ok=True)
     opts = {
         'quiet': True,
@@ -92,30 +106,27 @@ async def download_video(url):
         'format': 'best[filesize<50M]'
     }
     try:
-        loop = asyncio.get_event_loop()
-        def _dl():
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                filename = ydl.prepare_filename(info)
-                if not os.path.exists(filename):
-                    base = os.path.splitext(filename)[0]
-                    for ext in ['.mp4', '.mkv', '.webm']:
-                        if os.path.exists(base + ext):
-                            filename = base + ext
-                            break
-                return {
-                    'file': filename,
-                    'title': info.get('title', 'Video')[:100],
-                    'uploader': info.get('uploader', 'Unknown'),
-                    'duration': info.get('duration', 0)
-                }
-        return await loop.run_in_executor(None, _dl)
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+            if not os.path.exists(filename):
+                base = os.path.splitext(filename)[0]
+                for ext in ['.mp4', '.mkv', '.webm']:
+                    if os.path.exists(base + ext):
+                        filename = base + ext
+                        break
+            return {
+                'file': filename,
+                'title': info.get('title', 'Video')[:100],
+                'uploader': info.get('uploader', 'Unknown'),
+                'duration': info.get('duration', 0)
+            }
     except Exception as e:
         logger.error(f"Download error: {e}")
         raise e
 
 # ============ HANDLERS ============
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def start(update, context):
     user = update.effective_user
     db.add_user(user)
     
@@ -135,106 +146,80 @@ Facebook
 
 Just paste the link!"""
     
-    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def handle_link(update, context):
     user = update.effective_user
     url = update.message.text.strip()
     
     if not url.startswith('http'):
-        await update.message.reply_text("Send a valid URL starting with http")
+        update.message.reply_text("Send a valid URL starting with http")
         return
     
     platform = detect_platform(url)
     if not platform:
-        await update.message.reply_text("Unsupported platform")
+        update.message.reply_text("Unsupported platform")
         return
     
-    msg = await update.message.reply_text(f"Downloading from {platform}...")
+    msg = update.message.reply_text(f"Downloading from {platform}...")
     
     try:
-        result = await download_video(url)
+        result = download_video(url)
         
         size = os.path.getsize(result['file'])
         if size > 50 * 1024 * 1024:
-            await msg.edit_text("File too big (max 50MB)")
+            msg.edit_text("File too big (max 50MB)")
             os.remove(result['file'])
             return
         
         with open(result['file'], 'rb') as f:
-            await update.message.reply_video(
+            update.message.reply_video(
                 video=f,
                 caption=f"{result['title']}\nBy: {result['uploader']}\nNo watermark!"
             )
         
         db.log_download(user.id, platform, url)
-        await msg.delete()
+        msg.delete()
         os.remove(result['file'])
         
     except Exception as e:
-        await msg.edit_text(f"Error: {str(e)[:200]}\nCheck if video is public!")
+        msg.edit_text(f"Error: {str(e)[:200]}\nCheck if video is public!")
         db.log_download(user.id, platform, url, success=False)
 
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def stats_cmd(update, context):
     s = db.get_stats()
-    await update.message.reply_text(f"Users: {s['users']}\nDownloads: {s['downloads']}")
+    update.message.reply_text(f"Users: {s['users']}\nDownloads: {s['downloads']}")
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("How to use:\n1. Copy video link\n2. Paste here\n3. Wait for download")
+def help_cmd(update, context):
+    update.message.reply_text("How to use:\n1. Copy video link\n2. Paste here\n3. Wait for download")
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def button_handler(update, context):
     query = update.callback_query
-    await query.answer()
+    query.answer()
     if query.data == 'stats':
-        await stats_cmd(update, context)
+        stats_cmd(update, context)
     elif query.data == 'help':
-        await help_cmd(update, context)
+        help_cmd(update, context)
 
-# ============ FLASK APP ============
-app = Flask(__name__)
-
-# Initialize bot application (NO Updater!)
-bot_app = Application.builder().token(TOKEN).build()
-bot_app.add_handler(CommandHandler("start", start))
-bot_app.add_handler(CommandHandler("stats", stats_cmd))
-bot_app.add_handler(CommandHandler("help", help_cmd))
-bot_app.add_handler(CallbackQueryHandler(button_handler))
-bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-
-@app.route('/')
-def home():
-    return "Bot is running!"
-
-@app.route('/health')
-def health():
-    return {"status": "alive"}
-
-@app.route(f'/webhook/{TOKEN}', methods=['POST'])
-def webhook():
-    """Receive updates from Telegram"""
-    json_data = request.get_json(force=True)
-    update = Update.de_json(json_data, bot_app.bot)
-    
-    # Process update asynchronously
-    asyncio.run(bot_app.process_update(update))
-    return 'OK', 200
-
+# ============ MAIN ============
 def main():
-    # Get Render URL
-    render_url = os.environ.get("RENDER_EXTERNAL_URL")
-    port = int(os.environ.get("PORT", 10000))
+    # Start Flask in background (keeps Render alive)
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
     
-    if render_url:
-        # Set webhook
-        webhook_url = f"{render_url}/webhook/{TOKEN}"
-        asyncio.run(bot_app.bot.set_webhook(webhook_url))
-        logger.info(f"Webhook set to: {webhook_url}")
-    else:
-        logger.warning("No RENDER_EXTERNAL_URL - running locally without webhook")
+    # Use OLD style Updater (v13 compatible)
+    updater = Updater(TOKEN, use_context=True)
+    dp = updater.dispatcher
     
-    # Start Flask (THIS IS THE MAIN THING - keeps Render happy)
-    logger.info(f"Starting server on port {port}")
-    app.run(host='0.0.0.0', port=port, threaded=True)
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("stats", stats_cmd))
+    dp.add_handler(CommandHandler("help", help_cmd))
+    dp.add_handler(CallbackQueryHandler(button_handler))
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_link))
+    
+    logger.info("Bot started!")
+    updater.start_polling()
+    updater.idle()
 
 if __name__ == '__main__':
     main()
