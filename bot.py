@@ -4,7 +4,7 @@ import sqlite3
 import asyncio
 import re
 from datetime import datetime
-from flask import Flask, request
+from flask import Flask, request, jsonify
 import yt_dlp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters
@@ -14,7 +14,7 @@ TOKEN = os.environ.get("TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
 if not TOKEN:
-    raise ValueError("No TOKEN set!")
+    raise ValueError("No TOKEN environment variable set!")
 
 DB_PATH = "/tmp/bot.db"
 DOWNLOAD_PATH = "/tmp/downloads"
@@ -190,34 +190,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == 'help':
         await help_cmd(update, context)
 
-# ============ FLASK + WEBHOOK SETUP ============
-flask_app = Flask(__name__)
+# ============ FLASK APP ============
+app = Flask(__name__)
 
-# Initialize bot application
-application = Application.builder().token(TOKEN).build()
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("stats", stats_cmd))
-application.add_handler(CommandHandler("help", help_cmd))
-application.add_handler(CallbackQueryHandler(button_handler))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+# Initialize bot application (NO Updater!)
+bot_app = Application.builder().token(TOKEN).build()
+bot_app.add_handler(CommandHandler("start", start))
+bot_app.add_handler(CommandHandler("stats", stats_cmd))
+bot_app.add_handler(CommandHandler("help", help_cmd))
+bot_app.add_handler(CallbackQueryHandler(button_handler))
+bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
 
-@flask_app.route('/')
+@app.route('/')
 def home():
     return "Bot is running!"
 
-@flask_app.route('/health')
+@app.route('/health')
 def health():
     return {"status": "alive"}
 
-@flask_app.route(f'/webhook/{TOKEN}', methods=['POST'])
+@app.route(f'/webhook/{TOKEN}', methods=['POST'])
 def webhook():
     """Receive updates from Telegram"""
-    update = Update.de_json(request.get_json(force=True), application.bot)
-    asyncio.run(process_update(update))
+    json_data = request.get_json(force=True)
+    update = Update.de_json(json_data, bot_app.bot)
+    
+    # Process update asynchronously
+    asyncio.run(bot_app.process_update(update))
     return 'OK', 200
-
-async def process_update(update):
-    await application.process_update(update)
 
 def main():
     # Get Render URL
@@ -227,14 +227,14 @@ def main():
     if render_url:
         # Set webhook
         webhook_url = f"{render_url}/webhook/{TOKEN}"
-        asyncio.run(application.bot.set_webhook(webhook_url))
+        asyncio.run(bot_app.bot.set_webhook(webhook_url))
         logger.info(f"Webhook set to: {webhook_url}")
     else:
-        logger.warning("No RENDER_EXTERNAL_URL found, webhook not set")
+        logger.warning("No RENDER_EXTERNAL_URL - running locally without webhook")
     
-    # Start Flask
+    # Start Flask (THIS IS THE MAIN THING - keeps Render happy)
     logger.info(f"Starting server on port {port}")
-    flask_app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, threaded=True)
 
 if __name__ == '__main__':
     main()
