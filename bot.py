@@ -1,0 +1,252 @@
+import logging
+import os
+import sqlite3
+import asyncio
+import re
+import threading
+from datetime import datetime
+from flask import Flask
+import yt_dlp
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters
+from telegram.constants import ParseMode
+
+# ============ CONFIG ============
+TOKEN =
+os.environ.get("8654529573:AAHcPpsJ-YCRBJP-ZhrVmtrauhrQGq0HcQ0")
+ADMIN_ID = int(os.environ.get(7973440858))
+DB_PATH = "/tmp/bot_database.db"  # /tmp is writable on Render
+DOWNLOAD_PATH = "/tmp/downloads"
+
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ============ FLASK WEB SERVER (for Render) ============
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "🤖 Bot is running!"
+
+@app.route('/health')
+def health():
+    return {"status": "alive", "timestamp": datetime.now().isoformat()}
+
+def run_web():
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
+
+# ============ DATABASE ============
+class Database:
+    def __init__(self):
+        self.init_db()
+    
+    def init_db(self):
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS users 
+                     (user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, 
+                      joined_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP, total_downloads INTEGER DEFAULT 0)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS downloads 
+                     (id INTEGER PRIMARY KEY, user_id INTEGER, platform TEXT, url TEXT, 
+                      download_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP, success INTEGER DEFAULT 1)''')
+        conn.commit()
+        conn.close()
+    
+    def add_user(self, user):
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('INSERT OR IGNORE INTO users (user_id, username, first_name) VALUES (?, ?, ?)', 
+                  (user.id, user.username, user.first_name))
+        conn.commit()
+        conn.close()
+    
+    def log_download(self, user_id, platform, url, success=True):
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('INSERT INTO downloads (user_id, platform, url, success) VALUES (?, ?, ?, ?)', 
+                  (user_id, platform, url, 1 if success else 0))
+        c.execute('UPDATE users SET total_downloads = total_downloads + 1 WHERE user_id = ?', (user_id,))
+        conn.commit()
+        conn.close()
+    
+    def get_stats(self):
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users")
+        users = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM downloads WHERE success=1")
+        downloads = c.fetchone()[0]
+        conn.close()
+        return {'users': users, 'downloads': downloads}
+
+db = Database()
+
+# ============ PLATFORM DETECTION ============
+PLATFORMS = {
+    'tiktok': [r'tiktok\.com', r'vm\.tiktok\.com'],
+    'instagram': [r'instagram\.com/reel', r'instagr\.am'],
+    'youtube': [r'youtube\.com/shorts', r'youtu\.be'],
+    'twitter': [r'twitter\.com', r'x\.com'],
+    'facebook': [r'facebook\.com', r'fb\.watch']
+}
+
+def detect_platform(url):
+    url_lower = url.lower()
+    for plat, patterns in PLATFORMS.items():
+        if any(re.search(p, url_lower) for p in patterns):
+            return plat
+    return None
+
+# ============ DOWNLOADER ============
+async def download_video(url):
+    os.makedirs(DOWNLOAD_PATH, exist_ok=True)
+    opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'outtmpl': f'{DOWNLOAD_PATH}/%(title)s.%(ext)s',
+        'format': 'best[filesize<50M]'
+    }
+    try:
+        loop = asyncio.get_event_loop()
+        def _dl():
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filename = ydl.prepare_filename(info)
+                if not os.path.exists(filename):
+                    base = os.path.splitext(filename)[0]
+                    for ext in ['.mp4', '.mkv', '.webm']:
+                        if os.path.exists(base + ext):
+                            filename = base + ext
+                            break
+                return {
+                    'file': filename,
+                    'title': info.get('title', 'Video')[:100],
+                    'uploader': info.get('uploader', 'Unknown'),
+                    'duration': info.get('duration', 0)
+                }
+        return await loop.run_in_executor(None, _dl)
+    except Exception as e:
+        logger.error(f"Download error: {e}")
+        raise e
+
+# ============ HANDLERS ============
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    db.add_user(user)
+    
+    keyboard = [
+        [InlineKeyboardButton("📊 Stats", callback_data='stats')],
+        [InlineKeyboardButton("❓ Help", callback_data='help')]
+    ]
+    
+    text = f"""🎉 <b>Welcome {user.first_name}!</b>
+
+Send me video links from:
+🎵 TikTok (no watermark!)
+📸 Instagram Reels
+▶️ YouTube Shorts  
+🐦 Twitter/X
+📘 Facebook
+
+Just paste the link!"""
+    
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, 
+                                    reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    url = update.message.text.strip()
+    
+    if not url.startswith('http'):
+        await update.message.reply_text("❌ Send a valid URL starting with http")
+        return
+    
+    platform = detect_platform(url)
+    if not platform:
+        await update.message.reply_text("❌ Unsupported platform")
+        return
+    
+    msg = await update.message.reply_text(f"⏳ Downloading from {platform}...")
+    
+    try:
+        result = await download_video(url)
+        
+        size = os.path.getsize(result['file'])
+        if size > 50 * 1024 * 1024:
+            await msg.edit_text("❌ File too big (max 50MB)")
+            os.remove(result['file'])
+            return
+        
+        with open(result['file'], 'rb') as f:
+            await update.message.reply_video(
+                video=f,
+                caption=f"✅ <b>{result['title']}</b>\n👤 {result['uploader']}\n⏱ {result['duration']//60}:{result['duration']%60:02d} min\n\n💾 No watermark!",
+                parse_mode=ParseMode.HTML
+            )
+        
+        db.log_download(user.id, platform, url)
+        await msg.delete()
+        os.remove(result['file'])
+        
+    except Exception as e:
+        await msg.edit_text(f"❌ Error: {str(e)[:200]}\n\nCheck if video is public!")
+        db.log_download(user.id, platform, url, success=False)
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    s = db.get_stats()
+    await update.message.reply_text(f"📊 <b>Bot Stats</b>\n\n👥 Users: {s['users']}\n📥 Downloads: {s['downloads']}")
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("""❓ <b>How to use</b>
+
+1. Open TikTok/Instagram/etc
+2. Click Share → Copy Link
+3. Paste link here
+4. Wait for download
+
+<b>Commands:</b>
+/start - Start bot
+/stats - Statistics
+/help - This message""", parse_mode=ParseMode.HTML)
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == 'stats':
+        await stats_cmd(update, context)
+    elif query.data == 'help':
+        await help_cmd(update, context)
+
+async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    s = db.get_stats()
+    await update.message.reply_text(f"🔐 Admin\n\nUsers: {s['users']}\nDownloads: {s['downloads']}")
+
+# ============ MAIN ============
+def main():
+    # Start web server in background thread
+    web_thread = threading.Thread(target=run_web)
+    web_thread.daemon = True
+    web_thread.start()
+    
+    # Build bot application
+    application = (
+        Application.builder()
+        .token(TOKEN)
+        .build()
+    )
+    
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("stats", stats_cmd))
+    application.add_handler(CommandHandler("help", help_cmd))
+    application.add_handler(CommandHandler("admin", admin_cmd))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+    
+    logger.info("Bot started!")
+    application.run_polling(drop_pending_updates=True)
+
+if __name__ == '__main__':
+    main()
