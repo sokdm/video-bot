@@ -3,36 +3,44 @@ import os
 import sqlite3
 import asyncio
 import re
-import threading
 from datetime import datetime
-from flask import Flask
+from flask import Flask, request
 import yt_dlp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters
 
 # ============ CONFIG ============
-TOKEN = os.environ.get("TOKEN", "8654529573:AAHcPpsJ-YCRBJP-ZhrVmtrauhrQGq0HcQ0")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "7973440858"))
-DB_PATH = "/tmp/bot_database.db"
+TOKEN = os.environ.get("TOKEN")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL", "")  # Render provides this
+PORT = int(os.environ.get("PORT", 10000))
+
+if not TOKEN:
+    raise ValueError("No TOKEN environment variable set!")
+
+DB_PATH = "/tmp/bot.db"
 DOWNLOAD_PATH = "/tmp/downloads"
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ============ FLASK WEB SERVER (Required for Render) ============
-app = Flask(__name__)
+# ============ FLASK APP ============
+flask_app = Flask(__name__)
 
-@app.route('/')
+@flask_app.route('/')
 def home():
     return "Bot is running!"
 
-@app.route('/health')
+@flask_app.route('/health')
 def health():
-    return {"status": "alive", "users": db.get_stats()['users']}
+    return {"status": "alive"}
 
-def run_web():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+@flask_app.route(f'/webhook/{TOKEN}', methods=['POST'])
+def webhook():
+    """Receive webhook updates from Telegram"""
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    application.process_update(update)
+    return 'OK', 200
 
 # ============ DATABASE ============
 class Database:
@@ -126,6 +134,7 @@ async def download_video(url):
         logger.error(f"Download error: {e}")
         raise e
 
+# ============ HANDLERS ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     db.add_user(user)
@@ -205,19 +214,15 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     s = db.get_stats()
-    await update.message.reply_text(f"Admin Stats:\nUsers: {s['users']}\nDownloads: {s['downloads']}")
+    await update.message.reply_text(f"Admin:\nUsers: {s['users']}\nDownloads: {s['downloads']}")
 
 # ============ MAIN ============
-def main():
-    # Start web server in background
-    web_thread = threading.Thread(target=run_web, daemon=True)
-    web_thread.start()
-    logger.info("Web server started")
-    
-    # Build bot application
+application = None
+
+def init_bot():
+    global application
     application = Application.builder().token(TOKEN).build()
     
-    # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stats", stats_cmd))
     application.add_handler(CommandHandler("help", help_cmd))
@@ -225,10 +230,22 @@ def main():
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     
-    logger.info("Bot starting...")
-    # Use webhook for Render (more stable than polling for web services)
-    # For now, try polling with drop_pending_updates
-    application.run_polling(drop_pending_updates=True, timeout=30)
+    return application
+
+def main():
+    # Initialize bot
+    init_bot()
+    
+    # Set webhook if URL available (production)
+    if WEBHOOK_URL:
+        webhook_path = f"/webhook/{TOKEN}"
+        webhook_full_url = f"{WEBHOOK_URL}{webhook_path}"
+        application.bot.set_webhook(webhook_full_url)
+        logger.info(f"Webhook set to: {webhook_full_url}")
+    
+    # Start Flask server (this keeps Render happy)
+    logger.info(f"Starting server on port {PORT}")
+    flask_app.run(host='0.0.0.0', port=PORT)
 
 if __name__ == '__main__':
     main()
